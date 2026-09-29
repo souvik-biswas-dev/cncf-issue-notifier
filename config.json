@@ -1,6 +1,6 @@
 {
   "minScore": 3,
-  "firstRunLookbackMinutes": 10080,
+  "firstRunLookbackMinutes": 60,
   "skillKeywords": [
     "go",
     "golang",
