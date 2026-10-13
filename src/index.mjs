@@ -7,7 +7,7 @@ const API = process.env.GITHUB_API || "https://api.github.com";
 const DRY = !!process.env.DRY_RUN;
 const { GITHUB_TOKEN, GMAIL_USER, GMAIL_APP_PASSWORD, GEMINI_API_KEY } = process.env;
 const NOTIFY_TO = process.env.NOTIFY_TO || GMAIL_USER;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
 const MAX_LOOKBACK_MS = 6 * 3600_000; // never look back further than 6h after a failed run
 const focusSet = new Set((cfg.focusRepos || []).map((r) => r.toLowerCase()));
 
@@ -112,7 +112,9 @@ async function looksClaimed(issue) {
 
 // ---------- Gemini ----------
 // returns: object on success, null on failure (caller decides what to do)
+let geminiDown = false;   // set when Gemini fails permanently (404/400/403): stop calling it this run
 async function geminiRate(issue) {
+  if (geminiDown) return null;
   const prompt = `Candidate profile:\n${PROFILE}\n\nGitHub issue in ${issue.repo}:\nTitle: ${issue.title}\nLabels: ${issue.labels.map((l) => l.name).join(", ")}\nBody:\n${(issue.body || "").slice(0, 2500)}\n\nRate 1-10 how suitable this issue is for this candidate to pick up as an open-source contribution (clear scope, finishable in a few days, matches skills). Reply ONLY JSON: {"score":number,"summary":"one sentence"}`;
   try {
     const res = await fetch(
@@ -120,9 +122,14 @@ async function geminiRate(issue) {
       { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json" } }) }
     );
-    if (!res.ok) { console.warn(`! Gemini HTTP ${res.status}`); return null; }
+    if (!res.ok) {
+      console.warn(`! Gemini HTTP ${res.status}${res.status === 404 ? ` - model "${GEMINI_MODEL}" is retired or wrong; set GEMINI_MODEL` : ""}`);
+      if ([400, 403, 404].includes(res.status)) geminiDown = true;
+      return null;
+    }
     const j = await res.json();
-    const r = JSON.parse(j.candidates[0].content.parts[0].text);
+    const text = (j.candidates?.[0]?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || "").join("");
+    const r = JSON.parse(text);
     return typeof r.score === "number" ? r : null;
   } catch { return null; }
 }
@@ -185,7 +192,7 @@ async function main() {
     const aiBar = r.focus ? cfg.aiOnlyMinScore - 2 : cfg.aiOnlyMinScore;
     if (r.beginner) { if (ai && ai.score < 5) { judged[issue.id] = issue.updated_at; continue; } }
     else if (!ai || ai.score < aiBar) {
-      if (GEMINI_API_KEY && aiFailed) incomplete = true;   // Gemini hiccup: look at this issue again next run
+      if (GEMINI_API_KEY && aiFailed && !geminiDown) incomplete = true;   // temporary Gemini hiccup: look again next run
       else judged[issue.id] = issue.updated_at;
       continue;
     }
