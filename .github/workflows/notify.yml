@@ -8,6 +8,7 @@ concurrency:
   cancel-in-progress: false
 permissions:
   contents: read
+  actions: write            # only used by the keep-alive step below
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -15,17 +16,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+        with: { node-version: 20, cache: npm }
       - name: Restore state
         uses: actions/cache@v4
         with:
           path: state.json
           key: state-${{ github.run_id }}
           restore-keys: state-
-      - run: npm install --no-audit --no-fund
+      - run: npm ci --no-audit --no-fund
       - run: node src/index.mjs
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      # GitHub switches off scheduled workflows after 60 days without repo activity.
+      # Best effort: once a day, re-enable ourselves. If you ever get GitHub's
+      # "workflow disabled" e-mail, just press Enable in the Actions tab.
+      - name: Keep-alive (daily)
+        if: github.event_name == 'schedule'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(date -u +%H)" = "03" ] && [ "$(date -u +%M)" -lt 10 ]; then
+            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/notify.yml/enable"
+          fi

@@ -1,8 +1,12 @@
 {
   "name": "cncf-issue-notifier",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "private": true,
-  "scripts": { "start": "node src/index.mjs", "dry": "DRY_RUN=1 node src/index.mjs" },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "dry": "DRY_RUN=1 node src/index.mjs",
+    "validate": "node scripts/validate-repos.mjs"
+  },
   "dependencies": { "nodemailer": "^6.9.14" }
 }
