@@ -4,7 +4,8 @@
   "maxIssueAgeDays": 30,
   "maxComments": 8,
   "aiOnlyMinScore": 8,
-  "maxAiPerRun": 15,
+  "noAiMinScore": 8,
+  "maxAiPerRun": 8,
   "claimCheck": true,
   "focusRepos": [],
   "skillKeywords": [

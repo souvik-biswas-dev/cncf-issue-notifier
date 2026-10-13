@@ -7,7 +7,11 @@ const API = process.env.GITHUB_API || "https://api.github.com";
 const DRY = !!process.env.DRY_RUN;
 const { GITHUB_TOKEN, GMAIL_USER, GMAIL_APP_PASSWORD, GEMINI_API_KEY } = process.env;
 const NOTIFY_TO = process.env.NOTIFY_TO || GMAIL_USER;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+// Tried in order. If one is overloaded (503), out of quota (429) or retired (404), the next is used.
+const GEMINI_MODELS = (process.env.GEMINI_MODELS || process.env.GEMINI_MODEL || "gemini-3.5-flash,gemini-3-flash-preview")
+  .split(",").map((m) => m.trim()).filter(Boolean);
+const GEMINI_API = process.env.GEMINI_API || "https://generativelanguage.googleapis.com";
+const GEMINI_DELAY_MS = Number(process.env.GEMINI_DELAY_MS ?? 6500);   // ~9 requests/min: friendly to free-tier limits
 const MAX_LOOKBACK_MS = 6 * 3600_000; // never look back further than 6h after a failed run
 const focusSet = new Set((cfg.focusRepos || []).map((r) => r.toLowerCase()));
 
@@ -111,27 +115,36 @@ async function looksClaimed(issue) {
 }
 
 // ---------- Gemini ----------
-// returns: object on success, null on failure (caller decides what to do)
-let geminiDown = false;   // set when Gemini fails permanently (404/400/403): stop calling it this run
+// returns: object on success, null if every model failed (caller decides what to do)
+const deadModels = new Set();                       // models that failed permanently or ran out of quota in THIS run
+const geminiDown = () => GEMINI_MODELS.every((m) => deadModels.has(m));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let lastGemini = 0;
 async function geminiRate(issue) {
-  if (geminiDown) return null;
   const prompt = `Candidate profile:\n${PROFILE}\n\nGitHub issue in ${issue.repo}:\nTitle: ${issue.title}\nLabels: ${issue.labels.map((l) => l.name).join(", ")}\nBody:\n${(issue.body || "").slice(0, 2500)}\n\nRate 1-10 how suitable this issue is for this candidate to pick up as an open-source contribution (clear scope, finishable in a few days, matches skills). Reply ONLY JSON: {"score":number,"summary":"one sentence"}`;
-  try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
-      { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json" } }) }
-    );
-    if (!res.ok) {
-      console.warn(`! Gemini HTTP ${res.status}${res.status === 404 ? ` - model "${GEMINI_MODEL}" is retired or wrong; set GEMINI_MODEL` : ""}`);
-      if ([400, 403, 404].includes(res.status)) geminiDown = true;
-      return null;
-    }
-    const j = await res.json();
-    const text = (j.candidates?.[0]?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || "").join("");
-    const r = JSON.parse(text);
-    return typeof r.score === "number" ? r : null;
-  } catch { return null; }
+  for (const model of GEMINI_MODELS) {
+    if (deadModels.has(model)) continue;
+    const wait = lastGemini + GEMINI_DELAY_MS - Date.now();
+    if (wait > 0) await sleep(wait);
+    lastGemini = Date.now();
+    try {
+      const res = await fetch(`${GEMINI_API}/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json" } }),
+      });
+      if (!res.ok) {
+        const why = { 404: "model retired or wrong name", 429: "quota/rate limit - skipping this model for the rest of the run", 503: "model overloaded - trying next model" }[res.status] || "";
+        console.warn(`! Gemini ${model}: HTTP ${res.status} ${why}`);
+        if ([400, 403, 404, 429].includes(res.status)) deadModels.add(model);
+        continue;
+      }
+      const j = await res.json();
+      const text = (j.candidates?.[0]?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || "").join("");
+      const r = JSON.parse(text);
+      if (typeof r.score === "number") return r;
+    } catch (e) { console.warn(`! Gemini ${model}: ${e.message}`); }
+  }
+  return null;
 }
 
 // ---------- email ----------
@@ -191,11 +204,14 @@ async function main() {
     }
     const aiBar = r.focus ? cfg.aiOnlyMinScore - 2 : cfg.aiOnlyMinScore;
     if (r.beginner) { if (ai && ai.score < 5) { judged[issue.id] = issue.updated_at; continue; } }
-    else if (!ai || ai.score < aiBar) {
-      if (GEMINI_API_KEY && aiFailed && !geminiDown) incomplete = true;   // temporary Gemini hiccup: look again next run
-      else judged[issue.id] = issue.updated_at;
-      continue;
-    }
+    else if (!ai) {
+      // No AI answer. A very strong keyword match is still worth an e-mail; otherwise retry later if Gemini was just flaky.
+      if (r.score < cfg.noAiMinScore) {
+        if (GEMINI_API_KEY && aiFailed && !geminiDown()) incomplete = true;
+        else judged[issue.id] = issue.updated_at;
+        continue;
+      }
+    } else if (ai.score < aiBar) { judged[issue.id] = issue.updated_at; continue; }
     const claimed = await looksClaimed(issue);
     seen.add(issue.id);
     const base = ai ? ai.score : r.score;
