@@ -1,6 +1,6 @@
 # CNCF Issue Notifier (v2)
 
-Checks ~125 CNCF-ecosystem repos every 10 minutes, scores new/updated issues against your skills,
+Checks ~155 CNCF-ecosystem repos every 10 minutes, scores new/updated issues against your skills,
 and e-mails you a digest. Runs free on GitHub Actions.
 
 ## Setup
