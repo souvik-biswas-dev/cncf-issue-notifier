@@ -12,7 +12,7 @@ const GEMINI_MODELS = (process.env.GEMINI_MODELS || process.env.GEMINI_MODEL || 
   .split(",").map((m) => m.trim()).filter(Boolean);
 const GEMINI_API = process.env.GEMINI_API || "https://generativelanguage.googleapis.com";
 const GEMINI_DELAY_MS = Number(process.env.GEMINI_DELAY_MS ?? 6500);   // ~9 requests/min: friendly to free-tier limits
-const MAX_LOOKBACK_MS = 6 * 3600_000; // never look back further than 6h after a failed run
+const MAX_PAGES_PER_REPO = 20; // up to 2,000 issue records per repository per run
 const focusSet = new Set((cfg.focusRepos || []).map((r) => r.toLowerCase()));
 
 const PROFILE = `Full-stack developer, 2026 CS grad. Strong: Go (Gin), TypeScript/Node, React/Next.js/SvelteKit,
@@ -45,13 +45,17 @@ function loadState() {
 // - "gone":  repo renamed/deleted/blocked -> permanent, skip it (does not block the run)
 // - "error": rate limit / network / 5xx -> transient, the run is marked incomplete
 async function fetchRepo(repo, sinceMs, oldEtag) {
-  const oldest = Date.now() - cfg.maxIssueAgeDays * 86_400_000;
   const out = [];
   let etag = null;
   try {
-    for (let page = 1; page <= 3; page++) {
+    // state=all is intentional: an issue opened and closed between polls must
+    // still be reported. Sorting by created_at makes pagination a durable
+    // catch-up scan rather than relying on updated_at or only open issues.
+    for (let page = 1; page <= MAX_PAGES_PER_REPO; page++) {
       const headers = page === 1 && oldEtag ? { "If-None-Match": oldEtag } : {};
-      const res = await gh(`/repos/${repo}/issues?state=open&sort=updated&direction=desc&per_page=100&page=${page}`, headers);
+      const sort = cfg.notifyAllNewIssues ? "created" : "updated";
+      const issueState = cfg.notifyAllNewIssues ? "all" : "open";
+      const res = await gh(`/repos/${repo}/issues?state=${issueState}&sort=${sort}&direction=desc&per_page=100&page=${page}`, headers);
       if (res.status === 304) return { kind: "same" };
       if ([404, 410, 451].includes(res.status)) { console.warn(`! ${repo}: HTTP ${res.status} (missing/renamed/blocked) - run "npm run validate"`); return { kind: "gone" }; }
       if (!res.ok) { console.warn(`! ${repo}: HTTP ${res.status}`); return { kind: "error" }; }
@@ -59,15 +63,23 @@ async function fetchRepo(repo, sinceMs, oldEtag) {
       const items = await res.json();
       for (const i of items) {
         if (i.pull_request) continue;
-        if (Date.parse(i.updated_at) < sinceMs) continue;
-        if (Date.parse(i.created_at) <= oldest || i.comments > cfg.maxComments) continue;
-        out.push({ ...i, repo });
+        // In fast-notification mode, only newly created issues are relevant.
+        if (cfg.notifyAllNewIssues) {
+          if (Date.parse(i.created_at) >= sinceMs) out.push({ ...i, repo });
+        } else if (Date.parse(i.updated_at) >= sinceMs && i.comments <= cfg.maxComments) {
+          out.push({ ...i, repo });
+        }
       }
-      // PRs and bot activity are in this feed too, so busy repos need paging.
       const last = items[items.length - 1];
-      if (items.length < 100 || !last || Date.parse(last.updated_at) < sinceMs) break;
+      const pageTimestamp = last ? Date.parse(cfg.notifyAllNewIssues ? last.created_at : last.updated_at) : 0;
+      if (items.length < 100 || !last || pageTimestamp < sinceMs) {
+        return { kind: "ok", issues: out, etag };
+      }
     }
-    return { kind: "ok", issues: out, etag };
+    // Do not advance the global checkpoint if the page safety limit was hit.
+    // The next run will retry the same window and continue catching up.
+    console.warn(`! ${repo}: reached ${MAX_PAGES_PER_REPO} page safety limit; will retry this time window`);
+    return { kind: "error" };
   } catch (e) {
     console.warn(`! ${repo}: ${e.message}`);
     return { kind: "error" };
@@ -159,7 +171,7 @@ function renderEmail(matches) {
     <div style="border:1px solid ${m.focus ? "#d4a017" : "#ddd"};border-radius:8px;padding:12px;margin:10px 0;font-family:sans-serif">
       <div style="color:#666;font-size:12px">${m.focus ? "⭐ FOCUS · " : ""}${esc(m.repo)} · #${m.number} · opened ${ago(m.created_at)} · match ${m.finalScore}</div>
       <a href="${m.html_url}" style="font-size:16px;font-weight:600;color:#0969da;text-decoration:none">${esc(m.title)}</a>
-      <div style="margin:6px 0">${m.labels.map((l) => `<span style="background:#eef;border-radius:10px;padding:2px 8px;font-size:11px;margin-right:4px">${esc(l.name)}</span>`).join("")}</div>
+      <div style="margin:6px 0">${m.labels.map((l) => `<span style="background:#eef;border-radius:10px;padding:2px 8px;font-size:11px;margin-right:4px">${esc(typeof l === "string" ? l : l.name)}</span>`).join("")}</div>
       ${m.claimed ? `<div style="font-size:12px;color:#b45309">⚠ Someone may have already asked to work on this - read the comments first.</div>` : ""}
       ${m.ai ? `<div style="font-size:13px;color:#333">🤖 ${esc(m.ai.summary)} (AI: ${m.ai.score}/10)</div>` : `<div style="font-size:12px;color:#777">${esc(m.why.slice(0, 5).join(", "))}</div>`}
     </div>`).join("");
@@ -168,9 +180,14 @@ function renderEmail(matches) {
 
 // ---------- main ----------
 async function main() {
+  if (!DRY && (!GMAIL_USER || !GMAIL_APP_PASSWORD)) {
+    throw new Error("GMAIL_USER and GMAIL_APP_PASSWORD must be configured; refusing to advance notification state without email delivery.");
+  }
   const state = loadState();
   const now = Date.now();
-  const sinceMs = Math.max(state.lastRun ? state.lastRun - 60_000 : now - cfg.firstRunLookbackMinutes * 60_000, now - MAX_LOOKBACK_MS);
+  // Keep a small overlap for clock skew/retries, but never truncate a failed
+  // run to an arbitrary number of hours: long outages must catch up as well.
+  const sinceMs = state.lastRun ? state.lastRun - 2 * 60_000 : now - cfg.firstRunLookbackMinutes * 60_000;
   const seen = new Set(state.seen || []);
   const judged = state.judged || {};          // issue id -> updated_at we already judged
   const oldEtags = state.etags || {};
@@ -188,12 +205,21 @@ async function main() {
       else if (r.kind === "error") incomplete = true;
     });
   }
-  console.log(`Fetched ${all.length} updated issues from ${cfg.repos.length} repos (rate limit left: ${rateRemaining})`);
+  console.log(`Fetched ${all.length} new issues from ${cfg.repos.length} repos (rate limit left: ${rateRemaining})`);
 
   const matches = [];
   let aiCalls = 0;
   for (const issue of all) {
     if (seen.has(issue.id) || judged[issue.id] === issue.updated_at) continue;
+    if (cfg.notifyAllNewIssues) {
+      // This mode is intentionally unfiltered: every newly opened issue in the
+      // selected repositories is useful as an immediate heads-up.
+      const focus = focusSet.has(issue.repo.toLowerCase());
+      seen.add(issue.id);
+      matches.push({ ...issue, why: [], ai: null, focus, claimed: false, finalScore: 0, rank: 0 });
+      continue;
+    }
+
     const r = score(issue);
     if (!r || r.score < cfg.minScore) { judged[issue.id] = issue.updated_at; continue; }
 
@@ -222,7 +248,7 @@ async function main() {
 
   if (matches.length) {
     const subject = `[CNCF] ${matches.length} new issue${matches.length > 1 ? "s" : ""} for you - ${matches[0].repo}: ${matches[0].title}`.slice(0, 150);
-    if (DRY || !GMAIL_USER || !GMAIL_APP_PASSWORD) {
+    if (DRY) {
       console.log(subject); matches.forEach((m) => console.log(` - ${m.html_url} (${m.finalScore})${m.focus ? " [focus]" : ""}${m.claimed ? " [maybe claimed]" : ""}`));
     } else {
       const tx = nodemailer.createTransport({ service: "gmail", auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD } });
