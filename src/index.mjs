@@ -7,6 +7,7 @@ const API = process.env.GITHUB_API || "https://api.github.com";
 const DRY = !!process.env.DRY_RUN;
 const { GITHUB_TOKEN, GMAIL_USER, GMAIL_APP_PASSWORD, GEMINI_API_KEY } = process.env;
 const NOTIFY_TO = process.env.NOTIFY_TO || GMAIL_USER;
+const SEND_TEST_EMAIL = /^(1|true|yes)$/i.test(process.env.SEND_TEST_EMAIL || "");
 // Tried in order. If one is overloaded (503), out of quota (429) or retired (404), the next is used.
 const GEMINI_MODELS = (process.env.GEMINI_MODELS || process.env.GEMINI_MODEL || "gemini-3.5-flash,gemini-3-flash-preview")
   .split(",").map((m) => m.trim()).filter(Boolean);
@@ -180,6 +181,24 @@ function renderEmail(matches) {
 
 // ---------- main ----------
 async function main() {
+  console.log(`Notifier runtime: ${process.version}`);
+
+  if (SEND_TEST_EMAIL) {
+    if (!GMAIL_USER || !GMAIL_APP_PASSWORD) {
+      throw new Error("GMAIL_USER and GMAIL_APP_PASSWORD must be configured to send a test email.");
+    }
+    const tx = nodemailer.createTransport({ service: "gmail", auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD } });
+    const info = await tx.sendMail({
+      from: `CNCF Issue Bot <${GMAIL_USER}>`,
+      to: NOTIFY_TO,
+      subject: "[CNCF] Issue Notifier test email",
+      text: "Your CNCF Issue Notifier Gmail delivery is working.",
+      html: "<p>Your CNCF Issue Notifier Gmail delivery is working.</p><p>This test did not scan repositories or change notification state.</p>",
+    });
+    console.log(`Test email sent successfully (message id: ${info.messageId || "accepted"}).`);
+    return;
+  }
+
   if (!DRY && (!GMAIL_USER || !GMAIL_APP_PASSWORD)) {
     throw new Error("GMAIL_USER and GMAIL_APP_PASSWORD must be configured; refusing to advance notification state without email delivery.");
   }
@@ -255,6 +274,8 @@ async function main() {
       await tx.sendMail({ from: `CNCF Issue Bot <${GMAIL_USER}>`, to: NOTIFY_TO, subject, html: renderEmail(matches) });
       console.log("Email sent");
     }
+  } else {
+    console.log("No newly detected issues since the saved checkpoint; no email was sent.");
   }
 
   // If anything went wrong, keep the old window and old ETags so nothing is silently lost.

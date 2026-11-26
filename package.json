@@ -10,5 +10,8 @@
   },
   "dependencies": {
     "nodemailer": "^6.9.14"
+  },
+  "engines": {
+    "node": ">=26 <27"
   }
 }
