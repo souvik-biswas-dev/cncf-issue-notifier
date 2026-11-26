@@ -1,7 +1,7 @@
 name: CNCF issue notifier
 on:
   schedule:
-    - cron: "*/10 * * * *"   # GitHub may delay scheduled runs by a few minutes
+    - cron: "*/5 * * * *"   # GitHub may delay scheduled runs by a few minutes
   workflow_dispatch:
 concurrency:
   group: notifier
@@ -12,7 +12,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -29,6 +29,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_TO: ${{ vars.NOTIFY_TO }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       # GitHub switches off scheduled workflows after 60 days without repo activity.
       # Best effort: once a day, re-enable ourselves. If you ever get GitHub's
