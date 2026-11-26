@@ -28,7 +28,7 @@ A small GitHub Actions service that watches **10 selected repositories** and ema
 - Ignores edits to older issues, so an old issue becoming active does not look like a newly raised issue.
 - Deduplicates notifications using `state.json`, restored/saved by GitHub Actions cache. Each run scans all issue states (including issues closed between polls), paginates back to the last successful checkpoint, and does not advance that checkpoint if a repository fetch or email delivery fails.
 - Uses conditional ETag requests to reduce GitHub API usage when a repository has not changed. Catch-up scans can read up to 2,000 issue records per repository per run; if that safety limit is reached, the run retries the same time window instead of silently skipping it.
-- Supports manual runs from the Actions tab.
+- Supports manual runs from the Actions tab, including an optional test-email mode that does not scan issues or modify notification state.
 - Keeps the previous optional scoring/AI code available if `notifyAllNewIssues` is later changed to `false`.
 
 ## Required GitHub setup
@@ -44,7 +44,7 @@ No Gemini API key is required in this focused configuration.
 
 ## Run locally on Ubuntu
 
-Requires Node.js 20+ and npm.
+Requires Node.js 26.x and npm. The `.nvmrc` file selects Node.js 26 with nvm.
 
 ```bash
 npm ci
@@ -61,13 +61,19 @@ GITHUB_TOKEN="$(gh auth token)" npm run validate
 
 ## Run on GitHub
 
-- Go to **Actions → CNCF issue notifier → Run workflow** to test immediately.
+- Go to **Actions → CNCF issue notifier → Run workflow** to scan immediately. A manual scan sends email only when it finds issues created since the last checkpoint.
+- To verify Gmail independently, select **Send a test email** in the manual workflow form. This sends one test message and does not scan repositories or change `state.json`.
 - Scheduled checks run every five minutes on the repository's default branch.
 - Check the workflow run logs if no email arrives. Confirm the Gmail secrets are present and that the workflow is enabled.
 
 ## Change the monitored repositories
 
 Edit the `repos` array in `config.json`. Keep entries in `owner/repository` format. The `focusRepos` array only controls the focus marker in email; `notifyAllNewIssues: true` controls the all-new-issues behavior.
+
+## Runtime versions
+
+- The notifier runs on Node.js 26.x. The GitHub-maintained workflow actions (`checkout`, `setup-node`, and `cache`) currently declare the Node.js 24 action runtime internally; this is separate from the Node.js 26 runtime used by `src/index.mjs`.
+- A successful scan with zero new issues intentionally sends no email. The run log prints this explicitly.
 
 ## Important limitations
 
